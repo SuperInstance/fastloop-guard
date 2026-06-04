@@ -1,14 +1,16 @@
-mod engine;
-mod failure_tracker;
-mod rate_limiter;
-mod validator;
+mod cache;
+mod gate;
+mod hash;
+mod protocol;
+mod similarity;
 
-use engine::{GuardEngine, InterceptRequest, InterceptResponse};
-use tokio::net::UnixListener;
+use gate::Gate;
+use protocol::{Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, error, warn};
+use tokio::net::UnixListener;
+use tracing::{error, info, warn};
 
-const SOCK_PATH: &str = "/tmp/fastloop_guard.sock";
+const SOCK_PATH: &str = "/tmp/fastloop.sock";
 
 #[tokio::main]
 async fn main() {
@@ -28,35 +30,80 @@ async fn main() {
 
     info!("fastloop-guard listening on {}", SOCK_PATH);
 
-    let engine = std::sync::Arc::new(GuardEngine::new());
+    let gate = std::sync::Arc::new(Gate::new());
+
+    // Shutdown signal
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(shutdown_watcher(shutdown_tx));
 
     loop {
-        match listener.accept().await {
-            Ok((mut stream, _addr)) => {
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65536];
-                    match stream.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            let resp = match serde_json::from_slice::<InterceptRequest>(&buf[..n]) {
-                                Ok(req) => engine.process(req),
-                                Err(e) => InterceptResponse {
-                                    action: "ROUTE_TO_DEEP_LOOP".into(),
-                                    reason: format!("invalid request: {}", e),
-                                    state_hash: None,
-                                    duration_us: 0,
-                                },
-                            };
-                            if let Ok(json) = serde_json::to_vec(&resp) {
-                                let _ = stream.write_all(&json).await;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("read error: {}", e),
+        tokio::select! {
+            accept = listener.accept() => {
+                match accept {
+                    Ok((mut stream, _addr)) => {
+                        let gate = gate.clone();
+                        tokio::spawn(async move {
+                            handle_connection(&mut stream, &gate).await;
+                        });
                     }
-                });
+                    Err(e) => error!("accept error: {}", e),
+                }
             }
-            Err(e) => error!("accept error: {}", e),
+            _ = shutdown_rx.recv() => {
+                info!("shutting down gracefully");
+                break;
+            }
         }
     }
+
+    let _ = std::fs::remove_file(SOCK_PATH);
+    info!("fastloop-guard stopped");
+}
+
+async fn handle_connection(
+    stream: &mut tokio::net::UnixStream,
+    gate: &Gate,
+) {
+    let mut buf = vec![0u8; 65536];
+    match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => {
+            let resp = match serde_json::from_slice::<Request>(&buf[..n]) {
+                Ok(Request::Lookup(req)) => {
+                    let resp = gate.lookup(&req.query, req.threshold);
+                    Response::Cache(resp)
+                }
+                Ok(Request::Store(req)) => {
+                    gate.insert(&req.query, &req.response);
+                    Response::Store(protocol::StoreResponse { stored: true })
+                }
+                Ok(Request::Stats(_)) => gate.stats(),
+                Err(e) => {
+                    warn!("invalid request: {}", e);
+                    Response::Error(protocol::ErrorResponse {
+                        error: format!("invalid request: {}", e),
+                    })
+                }
+            };
+
+            if let Ok(json) = serde_json::to_vec(&resp) {
+                let _ = stream.write_all(&json).await;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("read error: {}", e),
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_watcher(tx: tokio::sync::mpsc::Sender<()>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    term.recv().await;
+    let _ = tx.send(()).await;
+}
+
+#[cfg(not(unix))]
+async fn shutdown_watcher(tx: tokio::sync::mpsc::Sender<()>) {
+    tokio::signal::ctrl_c().await.ok();
+    let _ = tx.send(()).await;
 }
