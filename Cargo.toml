@@ -1,4 +1,6 @@
 [package]
+description = "fastloop-guard - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/fastloop-guard"
 name = "fastloop-guard"
 version = "0.2.0"
 edition = "2021"
